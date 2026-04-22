@@ -1,0 +1,231 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { withAuth } from '@/lib/auth'
+import { supabaseAdmin } from '@/lib/supabase'
+import { errorResponse } from '@/lib/errors'
+import { z } from 'zod'
+
+const AddMemberSchema = z.object({
+  email: z.string().email(),
+  role: z.enum(['admin', 'member']),
+})
+
+const RemoveMemberSchema = z.object({
+  user_id: z.string().uuid(),
+})
+
+export const GET = withAuth(async (_req, user, params) => {
+  try {
+    const workspaceId = params.id
+
+    const { data: membership } = await supabaseAdmin
+      .from('workspace_members')
+      .select('role')
+      .eq('workspace_id', workspaceId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (!membership) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    const { data: members, error } = await supabaseAdmin
+      .from('workspace_members')
+      .select(`
+        id,
+        user_id,
+        role,
+        created_at
+      `)
+      .eq('workspace_id', workspaceId)
+      .order('created_at', { ascending: true })
+
+    if (error) throw error
+
+    const userIds = (members ?? []).map((member) => member.user_id)
+
+    let profiles: Array<{ id: string; full_name: string | null; avatar_url: string | null }> = []
+    if (userIds.length > 0) {
+      const { data: profileRows, error: profileError } = await supabaseAdmin
+        .from('profiles')
+        .select('id, full_name, avatar_url')
+        .in('id', userIds)
+
+      if (profileError) throw profileError
+      profiles = profileRows ?? []
+    }
+
+    const profileById = new Map(
+      (profiles ?? []).map((profile) => [profile.id, {
+        full_name: profile.full_name,
+        avatar_url: profile.avatar_url,
+      }])
+    )
+
+    const membersWithProfiles = (members ?? []).map((member) => ({
+      ...member,
+      profiles: profileById.get(member.user_id) ?? null,
+    }))
+
+    return NextResponse.json({ data: membersWithProfiles })
+  } catch (error) {
+    return errorResponse(error)
+  }
+})
+
+export const POST = withAuth(async (req, user, params) => {
+  try {
+    const workspaceId = params.id
+
+    const { data: membership } = await supabaseAdmin
+      .from('workspace_members')
+      .select('role')
+      .eq('workspace_id', workspaceId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (!membership || !['owner', 'admin'].includes(membership.role)) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    let body: unknown
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    }
+
+    const parsed = AddMemberSchema.safeParse(body)
+    if (!parsed.success) {
+      return NextResponse.json({ error: parsed.error.issues.map((issue) => issue.message).join(', ') || 'Invalid request body' }, { status: 400 })
+    }
+
+    const bodyData = parsed.data
+
+    const adminApi = supabaseAdmin.auth.admin as unknown as {
+      getUserByEmail?: (email: string) => Promise<{ data: { user: { id: string } | null }, error: unknown }>
+    }
+
+    let userData: { user: { id: string } | null } | null = null
+    let userError: unknown = null
+
+    if (adminApi.getUserByEmail) {
+      const result = await adminApi.getUserByEmail(bodyData.email)
+      userData = result.data
+      userError = result.error
+    } else {
+      const { data: userId, error: lookupError } = await supabaseAdmin
+        .rpc('lookup_user_id_by_email', { target_email: bodyData.email })
+      userData = { user: userId ? { id: userId as string } : null }
+      userError = lookupError
+    }
+
+    if (userError || !userData?.user) {
+      return NextResponse.json(
+        { error: 'No Sentinel AI account found for that email address.' },
+        { status: 404 }
+      )
+    }
+
+    const targetUserId = userData.user.id
+
+    const { data: existingMember } = await supabaseAdmin
+      .from('workspace_members')
+      .select('id')
+      .eq('workspace_id', workspaceId)
+      .eq('user_id', targetUserId)
+      .single()
+
+    if (existingMember) {
+      return NextResponse.json({ error: 'User is already a member' }, { status: 400 })
+    }
+
+    const { data: newMember, error } = await supabaseAdmin
+      .from('workspace_members')
+      .insert({
+        workspace_id: workspaceId,
+        user_id: targetUserId,
+        role: bodyData.role,
+      })
+      .select()
+      .single()
+
+    if (error) throw error
+
+    return NextResponse.json({ data: newMember }, { status: 201 })
+  } catch (error) {
+    return errorResponse(error)
+  }
+})
+
+export const DELETE = withAuth(async (req, user, params) => {
+  try {
+    const workspaceId = params.id
+
+    const { data: membership } = await supabaseAdmin
+      .from('workspace_members')
+      .select('role')
+      .eq('workspace_id', workspaceId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (!membership || !['owner', 'admin'].includes(membership.role)) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    let body: unknown
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    }
+
+    const parsed = RemoveMemberSchema.safeParse(body)
+    if (!parsed.success) {
+      return NextResponse.json({ error: parsed.error.issues.map((issue) => issue.message).join(', ') || 'Invalid request body' }, { status: 400 })
+    }
+
+    const { user_id: targetUserId } = parsed.data
+
+    const { data: targetMember } = await supabaseAdmin
+      .from('workspace_members')
+      .select('role')
+      .eq('workspace_id', workspaceId)
+      .eq('user_id', targetUserId)
+      .single()
+
+    if (!targetMember) {
+      return NextResponse.json({ error: 'Member not found' }, { status: 404 })
+    }
+
+    if (targetMember.role === 'owner') {
+      const { data: owners } = await supabaseAdmin
+        .from('workspace_members')
+        .select('id')
+        .eq('workspace_id', workspaceId)
+        .eq('role', 'owner')
+
+      if (owners && owners.length <= 1) {
+        return NextResponse.json(
+          { error: 'Cannot remove the last owner' },
+          { status: 400 }
+        )
+      }
+    }
+
+    const { error } = await supabaseAdmin
+      .from('workspace_members')
+      .delete()
+      .eq('workspace_id', workspaceId)
+      .eq('user_id', targetUserId)
+
+    if (error) throw error
+
+    return NextResponse.json({ data: { success: true } })
+  } catch (error) {
+    return errorResponse(error)
+  }
+})
+
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204 })
+}
